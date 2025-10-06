@@ -1,73 +1,135 @@
-// Композабл единого реактивного состояния авторизации.
-// Хранит { isAuth, user, token } в localStorage, даёт методы login/logout.
+import { ref, computed } from 'vue';
+import { supabase } from '@/lib/supabase';
 
-import { ref, computed, watch } from 'vue';
+const user = ref(null);
+const profile = ref(null);
+const session = ref(null);
+const loading = ref(true);
 
-const LS_KEY = 'auth';
+async function initAuth() {
+  try {
+    const { data: { session: currentSession } } = await supabase.auth.getSession();
+    session.value = currentSession;
+    user.value = currentSession?.user ?? null;
 
-// Глобальное (на модуль) реактивное состояние авторизации:
-const authState = ref({
-  isAuth: false,
-  user: null,   // { username: '...' }
-  token: null,  // демо-токен (строка)
+    if (user.value) {
+      await loadProfile();
+    }
+  } catch (error) {
+    console.error('Error initializing auth:', error);
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function loadProfile() {
+  if (!user.value) return;
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', user.value.id)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Error loading profile:', error);
+  } else {
+    profile.value = data;
+  }
+}
+
+supabase.auth.onAuthStateChange((event, currentSession) => {
+  (async () => {
+    session.value = currentSession;
+    user.value = currentSession?.user ?? null;
+
+    if (user.value) {
+      await loadProfile();
+    } else {
+      profile.value = null;
+    }
+  })();
 });
 
-// Инициализация из localStorage при загрузке модуля:
-(function loadAuthFromStorage() {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      // Минимальная валидация структуры:
-      authState.value = {
-        isAuth: !!parsed.isAuth,
-        user: parsed.user ?? null,
-        token: parsed.token ?? null,
-      };
-    }
-  } catch {
-    // Игнорируем ошибки JSON
-  }
-})();
+async function signUp({ email, password, fullName, role = 'engineer' }) {
+  const { data, error } = await supabase.auth.signUp({
+    email,
+    password,
+  });
 
-// Автосохранение состояния при любых изменениях:
-watch(
-  authState,
-  (val) => {
-    localStorage.setItem(LS_KEY, JSON.stringify(val));
-  },
-  { deep: true }
-);
+  if (error) throw error;
 
-// Псевдо-логин: принимает непустые username+password, генерит демо-токен.
-// В реале здесь запрос к API и получение реального JWT/сессии.
-function login({ username, password }) {
-  if (!username || !password) {
-    throw new Error('Введите логин и пароль');
+  if (data.user) {
+    const { error: profileError } = await supabase
+      .from('profiles')
+      .insert({
+        id: data.user.id,
+        full_name: fullName,
+        role: role,
+      });
+
+    if (profileError) throw profileError;
   }
-  const token = btoa(`${username}:${Date.now()}`); // демо-токен
-  authState.value = {
-    isAuth: true,
-    user: { username },
-    token,
-  };
-  return true;
+
+  return data;
 }
 
-// Выход: очищаем состояние
-function logout() {
-  authState.value = { isAuth: false, user: null, token: null };
+async function signIn({ email, password }) {
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+
+  if (error) throw error;
+  return data;
 }
 
-const isAuthenticated = computed(() => authState.value.isAuth);
-const currentUser = computed(() => authState.value.user);
+async function signOut() {
+  const { error } = await supabase.auth.signOut();
+  if (error) throw error;
+  user.value = null;
+  profile.value = null;
+  session.value = null;
+}
+
+async function updateProfile(updates) {
+  if (!user.value) throw new Error('No user logged in');
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .update(updates)
+    .eq('id', user.value.id)
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  profile.value = data;
+  return data;
+}
+
+const isAuthenticated = computed(() => !!user.value);
+const userRole = computed(() => profile.value?.role);
+const isManager = computed(() => userRole.value === 'manager');
+const isEngineer = computed(() => userRole.value === 'engineer');
+const isObserver = computed(() => userRole.value === 'observer');
 
 export function useAuth() {
   return {
-    authState,
+    user,
+    profile,
+    session,
+    loading,
     isAuthenticated,
-    currentUser,
-    login,
-    logout,
+    userRole,
+    isManager,
+    isEngineer,
+    isObserver,
+    initAuth,
+    signUp,
+    signIn,
+    signOut,
+    updateProfile,
+    loadProfile,
   };
 }
