@@ -1,5 +1,5 @@
 import { ref } from 'vue';
-import { supabase } from '@/lib/supabase';
+import { getFromStorage, saveToStorage, STORAGE_KEYS, generateId } from '@/utils/storage';
 
 export function useDefects() {
   const defects = ref([]);
@@ -7,47 +7,41 @@ export function useDefects() {
   const loading = ref(false);
   const error = ref(null);
 
-  async function fetchDefects(filters = {}) {
+  function fetchDefects(filters = {}) {
     loading.value = true;
     error.value = null;
 
     try {
-      let query = supabase
-        .from('defects')
-        .select(`
-          *,
-          project:projects(id, title),
-          stage:project_stages(id, title),
-          assigned_user:profiles!assigned_to(id, full_name),
-          created_user:profiles!created_by(id, full_name)
-        `)
-        .order('created_at', { ascending: false });
+      let data = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
 
-      if (filters.project_id) {
-        query = query.eq('project_id', filters.project_id);
+      if (filters.projectId) {
+        data = data.filter(d => d.projectId === filters.projectId);
       }
 
       if (filters.status) {
-        query = query.eq('status', filters.status);
+        data = data.filter(d => d.status === filters.status);
       }
 
       if (filters.priority) {
-        query = query.eq('priority', filters.priority);
+        data = data.filter(d => d.priority === filters.priority);
       }
 
-      if (filters.assigned_to) {
-        query = query.eq('assigned_to', filters.assigned_to);
+      if (filters.assignedTo) {
+        data = data.filter(d => d.assignedTo === filters.assignedTo);
       }
 
       if (filters.search) {
-        query = query.or(`title.ilike.%${filters.search}%,description.ilike.%${filters.search}%`);
+        const search = filters.search.toLowerCase();
+        data = data.filter(d =>
+          d.title.toLowerCase().includes(search) ||
+          (d.description && d.description.toLowerCase().includes(search))
+        );
       }
 
-      const { data, error: fetchError } = await query;
+      defects.value = data.sort((a, b) =>
+        new Date(b.createdAt) - new Date(a.createdAt)
+      );
 
-      if (fetchError) throw fetchError;
-
-      defects.value = data;
       return data;
     } catch (err) {
       error.value = err.message;
@@ -57,27 +51,15 @@ export function useDefects() {
     }
   }
 
-  async function fetchDefectById(id) {
+  function fetchDefectById(id) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { data, error: fetchError } = await supabase
-        .from('defects')
-        .select(`
-          *,
-          project:projects(id, title),
-          stage:project_stages(id, title),
-          assigned_user:profiles!assigned_to(id, full_name, role),
-          created_user:profiles!created_by(id, full_name, role)
-        `)
-        .eq('id', id)
-        .maybeSingle();
-
-      if (fetchError) throw fetchError;
-
-      currentDefect.value = data;
-      return data;
+      const data = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
+      const defect = data.find(d => d.id === id);
+      currentDefect.value = defect || null;
+      return defect;
     } catch (err) {
       error.value = err.message;
       console.error('Error fetching defect:', err);
@@ -86,27 +68,27 @@ export function useDefects() {
     }
   }
 
-  async function createDefect(defectData) {
+  function createDefect(defectData) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { data, error: createError } = await supabase
-        .from('defects')
-        .insert(defectData)
-        .select(`
-          *,
-          project:projects(id, title),
-          stage:project_stages(id, title),
-          assigned_user:profiles!assigned_to(id, full_name),
-          created_user:profiles!created_by(id, full_name)
-        `)
-        .single();
+      const data = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
 
-      if (createError) throw createError;
+      const newDefect = {
+        id: generateId(),
+        ...defectData,
+        status: defectData.status || 'new',
+        priority: defectData.priority || 'medium',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
 
-      defects.value = [data, ...defects.value];
-      return data;
+      data.push(newDefect);
+      saveToStorage(STORAGE_KEYS.DEFECTS, data);
+
+      defects.value = [newDefect, ...defects.value];
+      return newDefect;
     } catch (err) {
       error.value = err.message;
       console.error('Error creating defect:', err);
@@ -116,57 +98,56 @@ export function useDefects() {
     }
   }
 
-  async function updateDefect(id, updates, userId) {
+  function updateDefect(id, updates, userId = null) {
     loading.value = true;
     error.value = null;
 
     try {
-      const oldDefect = currentDefect.value || defects.value.find(d => d.id === id);
+      const data = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
+      const index = data.findIndex(d => d.id === id);
 
-      const { data, error: updateError } = await supabase
-        .from('defects')
-        .update(updates)
-        .eq('id', id)
-        .select(`
-          *,
-          project:projects(id, title),
-          stage:project_stages(id, title),
-          assigned_user:profiles!assigned_to(id, full_name),
-          created_user:profiles!created_by(id, full_name)
-        `)
-        .single();
+      if (index === -1) {
+        throw new Error('Дефект не найден');
+      }
 
-      if (updateError) throw updateError;
+      const oldDefect = { ...data[index] };
 
-      if (oldDefect && userId) {
-        const changes = [];
+      data[index] = {
+        ...data[index],
+        ...updates,
+        updatedAt: new Date().toISOString(),
+      };
+
+      saveToStorage(STORAGE_KEYS.DEFECTS, data);
+
+      if (userId) {
+        const history = getFromStorage(STORAGE_KEYS.HISTORY) || [];
         for (const [key, value] of Object.entries(updates)) {
           if (oldDefect[key] !== value) {
-            changes.push({
-              defect_id: id,
-              user_id: userId,
-              field_name: key,
-              old_value: String(oldDefect[key] || ''),
-              new_value: String(value || ''),
+            history.push({
+              id: generateId(),
+              defectId: id,
+              userId,
+              fieldName: key,
+              oldValue: String(oldDefect[key] || ''),
+              newValue: String(value || ''),
+              createdAt: new Date().toISOString(),
             });
           }
         }
-
-        if (changes.length > 0) {
-          await supabase.from('defect_history').insert(changes);
-        }
+        saveToStorage(STORAGE_KEYS.HISTORY, history);
       }
 
-      const index = defects.value.findIndex(d => d.id === id);
-      if (index !== -1) {
-        defects.value[index] = data;
+      const defectIndex = defects.value.findIndex(d => d.id === id);
+      if (defectIndex !== -1) {
+        defects.value[defectIndex] = data[index];
       }
 
       if (currentDefect.value?.id === id) {
-        currentDefect.value = data;
+        currentDefect.value = data[index];
       }
 
-      return data;
+      return data[index];
     } catch (err) {
       error.value = err.message;
       console.error('Error updating defect:', err);
@@ -176,23 +157,29 @@ export function useDefects() {
     }
   }
 
-  async function deleteDefect(id) {
+  function deleteDefect(id) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { error: deleteError } = await supabase
-        .from('defects')
-        .delete()
-        .eq('id', id);
+      const data = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
+      const filteredData = data.filter(d => d.id !== id);
 
-      if (deleteError) throw deleteError;
+      saveToStorage(STORAGE_KEYS.DEFECTS, filteredData);
 
       defects.value = defects.value.filter(d => d.id !== id);
 
       if (currentDefect.value?.id === id) {
         currentDefect.value = null;
       }
+
+      const comments = getFromStorage(STORAGE_KEYS.COMMENTS) || [];
+      const filteredComments = comments.filter(c => c.defectId !== id);
+      saveToStorage(STORAGE_KEYS.COMMENTS, filteredComments);
+
+      const history = getFromStorage(STORAGE_KEYS.HISTORY) || [];
+      const filteredHistory = history.filter(h => h.defectId !== id);
+      saveToStorage(STORAGE_KEYS.HISTORY, filteredHistory);
     } catch (err) {
       error.value = err.message;
       console.error('Error deleting defect:', err);
@@ -202,172 +189,70 @@ export function useDefects() {
     }
   }
 
-  async function fetchDefectHistory(defectId) {
+  function fetchDefectHistory(defectId) {
     try {
-      const { data, error: fetchError } = await supabase
-        .from('defect_history')
-        .select(`
-          *,
-          user:profiles(full_name)
-        `)
-        .eq('defect_id', defectId)
-        .order('created_at', { ascending: false });
-
-      if (fetchError) throw fetchError;
-
-      return data;
+      const history = getFromStorage(STORAGE_KEYS.HISTORY) || [];
+      return history
+        .filter(h => h.defectId === defectId)
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     } catch (err) {
       console.error('Error fetching defect history:', err);
       throw err;
     }
   }
 
-  async function fetchDefectComments(defectId) {
+  function fetchDefectComments(defectId) {
     try {
-      const { data, error: fetchError } = await supabase
-        .from('defect_comments')
-        .select(`
-          *,
-          user:profiles(full_name, avatar_url)
-        `)
-        .eq('defect_id', defectId)
-        .order('created_at', { ascending: true });
-
-      if (fetchError) throw fetchError;
-
-      return data;
+      const comments = getFromStorage(STORAGE_KEYS.COMMENTS) || [];
+      return comments
+        .filter(c => c.defectId === defectId)
+        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
     } catch (err) {
       console.error('Error fetching comments:', err);
       throw err;
     }
   }
 
-  async function addComment(defectId, userId, content) {
+  function addComment(defectId, userId, content) {
     try {
-      const { data, error: insertError } = await supabase
-        .from('defect_comments')
-        .insert({
-          defect_id: defectId,
-          user_id: userId,
-          content,
-        })
-        .select(`
-          *,
-          user:profiles(full_name, avatar_url)
-        `)
-        .single();
+      const comments = getFromStorage(STORAGE_KEYS.COMMENTS) || [];
 
-      if (insertError) throw insertError;
+      const newComment = {
+        id: generateId(),
+        defectId,
+        userId,
+        content,
+        createdAt: new Date().toISOString(),
+      };
 
-      return data;
+      comments.push(newComment);
+      saveToStorage(STORAGE_KEYS.COMMENTS, comments);
+
+      return newComment;
     } catch (err) {
       console.error('Error adding comment:', err);
       throw err;
     }
   }
 
-  async function deleteComment(commentId) {
+  function deleteComment(commentId) {
     try {
-      const { error: deleteError } = await supabase
-        .from('defect_comments')
-        .delete()
-        .eq('id', commentId);
-
-      if (deleteError) throw deleteError;
+      const comments = getFromStorage(STORAGE_KEYS.COMMENTS) || [];
+      const filteredComments = comments.filter(c => c.id !== commentId);
+      saveToStorage(STORAGE_KEYS.COMMENTS, filteredComments);
     } catch (err) {
       console.error('Error deleting comment:', err);
       throw err;
     }
   }
 
-  async function fetchDefectAttachments(defectId) {
+  function getStatistics(projectId = null) {
     try {
-      const { data, error: fetchError } = await supabase
-        .from('defect_attachments')
-        .select(`
-          *,
-          uploader:profiles!uploaded_by(full_name)
-        `)
-        .eq('defect_id', defectId)
-        .order('created_at', { ascending: false });
-
-      if (fetchError) throw fetchError;
-
-      return data;
-    } catch (err) {
-      console.error('Error fetching attachments:', err);
-      throw err;
-    }
-  }
-
-  async function uploadAttachment(defectId, file, userId) {
-    try {
-      const fileExt = file.name.split('.').pop();
-      const fileName = `${Math.random()}.${fileExt}`;
-      const filePath = `defects/${defectId}/${fileName}`;
-
-      const { error: uploadError } = await supabase.storage
-        .from('defect-attachments')
-        .upload(filePath, file);
-
-      if (uploadError) throw uploadError;
-
-      const { data, error: insertError } = await supabase
-        .from('defect_attachments')
-        .insert({
-          defect_id: defectId,
-          file_name: file.name,
-          file_path: filePath,
-          file_size: file.size,
-          mime_type: file.type,
-          uploaded_by: userId,
-        })
-        .select(`
-          *,
-          uploader:profiles!uploaded_by(full_name)
-        `)
-        .single();
-
-      if (insertError) throw insertError;
-
-      return data;
-    } catch (err) {
-      console.error('Error uploading attachment:', err);
-      throw err;
-    }
-  }
-
-  async function deleteAttachment(attachmentId, filePath) {
-    try {
-      await supabase.storage
-        .from('defect-attachments')
-        .remove([filePath]);
-
-      const { error: deleteError } = await supabase
-        .from('defect_attachments')
-        .delete()
-        .eq('id', attachmentId);
-
-      if (deleteError) throw deleteError;
-    } catch (err) {
-      console.error('Error deleting attachment:', err);
-      throw err;
-    }
-  }
-
-  async function getStatistics(projectId = null) {
-    try {
-      let query = supabase
-        .from('defects')
-        .select('status, priority');
+      let data = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
 
       if (projectId) {
-        query = query.eq('project_id', projectId);
+        data = data.filter(d => d.projectId === projectId);
       }
-
-      const { data, error: fetchError } = await query;
-
-      if (fetchError) throw fetchError;
 
       const stats = {
         total: data.length,
@@ -401,9 +286,6 @@ export function useDefects() {
     fetchDefectComments,
     addComment,
     deleteComment,
-    fetchDefectAttachments,
-    uploadAttachment,
-    deleteAttachment,
     getStatistics,
   };
 }

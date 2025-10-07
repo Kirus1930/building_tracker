@@ -1,5 +1,5 @@
 import { ref } from 'vue';
-import { supabase } from '@/lib/supabase';
+import { getFromStorage, saveToStorage, STORAGE_KEYS, generateId } from '@/utils/storage';
 
 export function useProjects() {
   const projects = ref([]);
@@ -7,28 +7,15 @@ export function useProjects() {
   const loading = ref(false);
   const error = ref(null);
 
-  async function fetchProjects(filters = {}) {
+  function fetchProjects() {
     loading.value = true;
     error.value = null;
 
     try {
-      let query = supabase
-        .from('projects')
-        .select(`
-          *,
-          created_by_profile:profiles!created_by(full_name)
-        `)
-        .order('created_at', { ascending: false });
-
-      if (filters.status) {
-        query = query.eq('status', filters.status);
-      }
-
-      const { data, error: fetchError } = await query;
-
-      if (fetchError) throw fetchError;
-
-      projects.value = data;
+      const data = getFromStorage(STORAGE_KEYS.PROJECTS) || [];
+      projects.value = data.sort((a, b) =>
+        new Date(b.createdAt) - new Date(a.createdAt)
+      );
     } catch (err) {
       error.value = err.message;
       console.error('Error fetching projects:', err);
@@ -37,25 +24,15 @@ export function useProjects() {
     }
   }
 
-  async function fetchProjectById(id) {
+  function fetchProjectById(id) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { data, error: fetchError } = await supabase
-        .from('projects')
-        .select(`
-          *,
-          created_by_profile:profiles!created_by(full_name),
-          stages:project_stages(*)
-        `)
-        .eq('id', id)
-        .maybeSingle();
-
-      if (fetchError) throw fetchError;
-
-      currentProject.value = data;
-      return data;
+      const data = getFromStorage(STORAGE_KEYS.PROJECTS) || [];
+      const project = data.find(p => p.id === id);
+      currentProject.value = project || null;
+      return project;
     } catch (err) {
       error.value = err.message;
       console.error('Error fetching project:', err);
@@ -64,21 +41,26 @@ export function useProjects() {
     }
   }
 
-  async function createProject(projectData) {
+  function createProject(projectData) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { data, error: createError } = await supabase
-        .from('projects')
-        .insert(projectData)
-        .select()
-        .single();
+      const data = getFromStorage(STORAGE_KEYS.PROJECTS) || [];
 
-      if (createError) throw createError;
+      const newProject = {
+        id: generateId(),
+        ...projectData,
+        status: projectData.status || 'active',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
 
-      projects.value = [data, ...projects.value];
-      return data;
+      data.push(newProject);
+      saveToStorage(STORAGE_KEYS.PROJECTS, data);
+
+      projects.value = [newProject, ...projects.value];
+      return newProject;
     } catch (err) {
       error.value = err.message;
       console.error('Error creating project:', err);
@@ -88,30 +70,36 @@ export function useProjects() {
     }
   }
 
-  async function updateProject(id, updates) {
+  function updateProject(id, updates) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { data, error: updateError } = await supabase
-        .from('projects')
-        .update(updates)
-        .eq('id', id)
-        .select()
-        .single();
+      const data = getFromStorage(STORAGE_KEYS.PROJECTS) || [];
+      const index = data.findIndex(p => p.id === id);
 
-      if (updateError) throw updateError;
+      if (index === -1) {
+        throw new Error('Проект не найден');
+      }
 
-      const index = projects.value.findIndex(p => p.id === id);
-      if (index !== -1) {
-        projects.value[index] = data;
+      data[index] = {
+        ...data[index],
+        ...updates,
+        updatedAt: new Date().toISOString(),
+      };
+
+      saveToStorage(STORAGE_KEYS.PROJECTS, data);
+
+      const projectIndex = projects.value.findIndex(p => p.id === id);
+      if (projectIndex !== -1) {
+        projects.value[projectIndex] = data[index];
       }
 
       if (currentProject.value?.id === id) {
-        currentProject.value = { ...currentProject.value, ...data };
+        currentProject.value = data[index];
       }
 
-      return data;
+      return data[index];
     } catch (err) {
       error.value = err.message;
       console.error('Error updating project:', err);
@@ -121,111 +109,28 @@ export function useProjects() {
     }
   }
 
-  async function deleteProject(id) {
+  function deleteProject(id) {
     loading.value = true;
     error.value = null;
 
     try {
-      const { error: deleteError } = await supabase
-        .from('projects')
-        .delete()
-        .eq('id', id);
+      const data = getFromStorage(STORAGE_KEYS.PROJECTS) || [];
+      const filteredData = data.filter(p => p.id !== id);
 
-      if (deleteError) throw deleteError;
+      saveToStorage(STORAGE_KEYS.PROJECTS, filteredData);
 
       projects.value = projects.value.filter(p => p.id !== id);
 
       if (currentProject.value?.id === id) {
         currentProject.value = null;
       }
+
+      const defects = getFromStorage(STORAGE_KEYS.DEFECTS) || [];
+      const updatedDefects = defects.filter(d => d.projectId !== id);
+      saveToStorage(STORAGE_KEYS.DEFECTS, updatedDefects);
     } catch (err) {
       error.value = err.message;
       console.error('Error deleting project:', err);
-      throw err;
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  async function createStage(projectId, stageData) {
-    loading.value = true;
-    error.value = null;
-
-    try {
-      const { data, error: createError } = await supabase
-        .from('project_stages')
-        .insert({
-          project_id: projectId,
-          ...stageData
-        })
-        .select()
-        .single();
-
-      if (createError) throw createError;
-
-      if (currentProject.value?.id === projectId) {
-        currentProject.value.stages = [...(currentProject.value.stages || []), data];
-      }
-
-      return data;
-    } catch (err) {
-      error.value = err.message;
-      console.error('Error creating stage:', err);
-      throw err;
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  async function updateStage(stageId, updates) {
-    loading.value = true;
-    error.value = null;
-
-    try {
-      const { data, error: updateError } = await supabase
-        .from('project_stages')
-        .update(updates)
-        .eq('id', stageId)
-        .select()
-        .single();
-
-      if (updateError) throw updateError;
-
-      if (currentProject.value?.stages) {
-        const index = currentProject.value.stages.findIndex(s => s.id === stageId);
-        if (index !== -1) {
-          currentProject.value.stages[index] = data;
-        }
-      }
-
-      return data;
-    } catch (err) {
-      error.value = err.message;
-      console.error('Error updating stage:', err);
-      throw err;
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  async function deleteStage(stageId) {
-    loading.value = true;
-    error.value = null;
-
-    try {
-      const { error: deleteError } = await supabase
-        .from('project_stages')
-        .delete()
-        .eq('id', stageId);
-
-      if (deleteError) throw deleteError;
-
-      if (currentProject.value?.stages) {
-        currentProject.value.stages = currentProject.value.stages.filter(s => s.id !== stageId);
-      }
-    } catch (err) {
-      error.value = err.message;
-      console.error('Error deleting stage:', err);
       throw err;
     } finally {
       loading.value = false;
@@ -242,8 +147,5 @@ export function useProjects() {
     createProject,
     updateProject,
     deleteProject,
-    createStage,
-    updateStage,
-    deleteStage,
   };
 }
